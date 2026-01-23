@@ -2,7 +2,7 @@ name: NBP – kursy walut (API NBP, od 2021)
 
 on:
   schedule:
-    - cron: '0 9 * * *'   # codziennie o 09:00 UTC+0
+    - cron: '0 13 * * *'   # codziennie o 13:00 UTC+0
   workflow_dispatch:
 
 permissions:
