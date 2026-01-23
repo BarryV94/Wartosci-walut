@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Catalog — exc/ (universal)</title>
+  <title>Catalog — docs/ (universal)</title>
   <style>
     :root{--bg:#f6f7fb;--card:#fff;--muted:#6b7280;--accent:#2563eb}
     body{font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;padding:32px;background:var(--bg);color:#111}
@@ -32,8 +32,8 @@
   <div class="wrap">
     <header>
       <div>
-        <h1>Files from <span class="small">exc/</span> — <span id="repoTag" class="badge">(not detected)</span></h1>
-        <p class="lead">Universal index — upload this file to any GitHub repository and it will show files from the repository's <code>exc/</code> folder. You can also force the repository using URL parameters.</p>
+        <h1>Files from <span class="small">docs/</span> — <span id="repoTag" class="badge">(not detected)</span></h1>
+        <p class="lead">Universal index — upload this file to any GitHub repository and it will show files from the repository's <code>docs/</code> folder. You can also force the repository using URL parameters.</p>
       </div>
     </header>
 
@@ -129,7 +129,7 @@
     function renderTable(files, owner, repo, branch){
       const container = qs('#listcontainer');
       if(files.length === 0){
-        container.innerHTML = '<div class="empty">No files found in <code>exc/</code> (or repo not found).</div>';
+        container.innerHTML = '<div class="empty">No files found in <code>docs/</code> (or repo not found).</div>';
         qs('#count').textContent = '0 files';
         return;
       }
@@ -202,9 +202,9 @@
           }
 
           const tree = await fetchGitTree(owner, repo, branch);
-          // filter exc/
+          // filter docs/
           const includeSub = qs('#includeSub').checked;
-          let files = tree.filter(item => item.path.startsWith('exc/'));
+          let files = tree.filter(item => item.path.startsWith('docs/'));
           if(!includeSub){
             files = files.filter(item => {
               const p = item.path.replace(/^docs\//,'');
