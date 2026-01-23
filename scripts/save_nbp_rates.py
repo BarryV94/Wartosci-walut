@@ -10,16 +10,12 @@ import os
 import sys
 import tempfile
 
-# =========================
-# KONFIGURACJA
-# =========================
-
 TZ = "Europe/Warsaw"
 
 BASE_OUT_DIR = os.path.join("docs", "exc")
 MAX_FILES_PER_DIR = 999
 
-START_DATE = date(2021, 1, 1)
+START_DATE = date(2016, 1, 1)
 CHUNK_DAYS = 93
 
 BACKFILL_MARKER = os.path.join(BASE_OUT_DIR, ".backfill_done")
@@ -37,10 +33,6 @@ SINGLE_DAY_URL = (
 HEADERS = {
     "User-Agent": "nbp-exchange-rates-fetcher/1.0"
 }
-
-# =========================
-# FOLDER LOGIC
-# =========================
 
 def ensure_base_dir():
     os.makedirs(BASE_OUT_DIR, exist_ok=True)
@@ -69,10 +61,6 @@ def pick_target_dir():
 def path_for_date(d: date):
     base = pick_target_dir()
     return os.path.join(base, d.strftime("%d_%m_%Y.json"))
-
-# =========================
-# IO
-# =========================
 
 def write_json_atomic(path, data):
     fd, tmp_path = tempfile.mkstemp(
@@ -110,10 +98,6 @@ def http_get(url):
         print("❌ HTTP:", e)
         return e
 
-# =========================
-# LAST MARKER (HISTORIA)
-# =========================
-
 def append_last_marker(path):
     try:
         with open(LAST_MARKER, "a", encoding="utf-8") as f:
@@ -121,10 +105,6 @@ def append_last_marker(path):
             f.write(f"{now_str}: {path}\n")
     except Exception as e:
         print("❌ Błąd zapisu .last:", e)
-
-# =========================
-# NBP
-# =========================
 
 def process_table_entry(entry):
     eff_date = entry["effectiveDate"]
@@ -196,10 +176,6 @@ def fetch_today(today: date):
     for entry in data:
         process_table_entry(entry)
     return True
-
-# =========================
-# MAIN
-# =========================
 
 def main():
     ensure_base_dir()
