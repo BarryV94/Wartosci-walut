@@ -22,6 +22,8 @@ MAX_FILES_PER_DIR = 999
 START_DATE = date(2021, 1, 1)
 CHUNK_DAYS = 93
 
+BACKFILL_MARKER = os.path.join(BASE_OUT_DIR, ".backfill_done")
+
 BASE_TABLE_URL = (
     "https://api.nbp.pl/api/exchangerates/tables/A/"
     "{start}/{end}/?format=json"
@@ -36,7 +38,7 @@ HEADERS = {
 }
 
 # =========================
-# POMOCNICZE
+# FOLDER LOGIC
 # =========================
 
 def ensure_base_dir():
@@ -45,14 +47,10 @@ def ensure_base_dir():
 
 def existing_subdirs():
     result = []
-    if not os.path.exists(BASE_OUT_DIR):
-        return result
-
     for name in os.listdir(BASE_OUT_DIR):
         path = os.path.join(BASE_OUT_DIR, name)
         if os.path.isdir(path) and name.isdigit():
             result.append(int(name))
-
     return sorted(result)
 
 
@@ -64,22 +62,21 @@ def pick_target_dir():
     else:
         last = subs[-1]
         last_path = os.path.join(BASE_OUT_DIR, str(last))
-        json_count = len([
-            f for f in os.listdir(last_path)
-            if f.endswith(".json")
-        ])
-        target = last if json_count < MAX_FILES_PER_DIR else last + 1
+        count = len([f for f in os.listdir(last_path) if f.endswith(".json")])
+        target = last if count < MAX_FILES_PER_DIR else last + 1
 
-    target_path = os.path.join(BASE_OUT_DIR, str(target))
-    os.makedirs(target_path, exist_ok=True)
-    return target_path
+    path = os.path.join(BASE_OUT_DIR, str(target))
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def path_for_date(d: date):
     base = pick_target_dir()
-    filename = d.strftime("%d_%m_%Y.json")
-    return os.path.join(base, filename)
+    return os.path.join(base, d.strftime("%d_%m_%Y.json"))
 
+# =========================
+# IO
+# =========================
 
 def write_json_atomic(path, data):
     fd, tmp_path = tempfile.mkstemp(
@@ -88,13 +85,11 @@ def write_json_atomic(path, data):
     )
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(
-                json.dumps(
-                    data,
-                    ensure_ascii=False,
-                    separators=(",", ":")
-                ).encode("utf-8")
-            )
+            f.write(json.dumps(
+                data,
+                ensure_ascii=False,
+                separators=(",", ":")
+            ).encode("utf-8"))
         os.replace(tmp_path, path)
         print("✅ Zapisano:", path)
         return True
@@ -117,35 +112,33 @@ def http_get(url):
     except urllib.error.HTTPError as e:
         return e
     except Exception as e:
-        print("❌ Błąd HTTP:", e)
+        print("❌ HTTP:", e)
         return e
 
 # =========================
-# LOGIKA NBP
+# NBP
 # =========================
 
 def process_table_entry(entry):
-    eff_date = entry.get("effectiveDate")
-    rates = entry.get("rates", [])
+    eff_date = entry["effectiveDate"]
+    rates = entry["rates"]
 
     d = datetime.strptime(eff_date, "%Y-%m-%d").date()
     out_path = path_for_date(d)
 
     if os.path.exists(out_path):
-        print("✔ Istnieje:", out_path)
         return True
-
-    simplified = []
-    for r in rates:
-        simplified.append({
-            "currency": r.get("currency"),
-            "code": r.get("code"),
-            "mid": r.get("mid"),
-        })
 
     payload = {
         "date": eff_date,
-        "rates": simplified,
+        "rates": [
+            {
+                "currency": r["currency"],
+                "code": r["code"],
+                "mid": r["mid"],
+            }
+            for r in rates
+        ],
     }
 
     return write_json_atomic(out_path, payload)
@@ -156,74 +149,56 @@ def fetch_range(start_d: date, end_d: date):
         start=start_d.isoformat(),
         end=end_d.isoformat()
     )
-    print(f"⬇ Zakres: {start_d} → {end_d}")
-
     resp = http_get(url)
-
-    if isinstance(resp, urllib.error.HTTPError):
-        print(f"❌ HTTP {resp.code} dla zakresu")
-        return None
 
     if isinstance(resp, Exception):
         return None
 
     try:
         return json.loads(resp)
-    except Exception as e:
-        print("❌ Błąd JSON:", e)
+    except Exception:
         return None
 
 
-def backfill(start_d: date, end_d: date):
-    cur = start_d
-    ok = True
+def backfill():
+    print("🔁 BACKFILL od 2021")
+    cur = START_DATE
+    today = date.today()
 
-    while cur <= end_d:
-        chunk_end = min(cur + timedelta(days=CHUNK_DAYS - 1), end_d)
+    while cur <= today:
+        chunk_end = min(cur + timedelta(days=CHUNK_DAYS - 1), today)
         data = fetch_range(cur, chunk_end)
 
-        if data is None:
-            ok = False
-            cur = chunk_end + timedelta(days=1)
-            continue
-
-        for entry in data:
-            if not process_table_entry(entry):
-                ok = False
+        if data:
+            for entry in data:
+                process_table_entry(entry)
 
         cur = chunk_end + timedelta(days=1)
 
-    return ok
+    with open(BACKFILL_MARKER, "w") as f:
+        f.write(datetime.utcnow().isoformat())
+
+    print("✅ BACKFILL ZAKOŃCZONY")
 
 
 def fetch_today(today: date):
     url = SINGLE_DAY_URL.format(date=today.isoformat())
-    print("⬇ Dzień:", today)
-
     resp = http_get(url)
 
     if isinstance(resp, urllib.error.HTTPError):
         if resp.code == 404:
-            print("ℹ Brak publikacji (weekend/święto)")
+            print("ℹ Brak kursu (weekend/święto)")
             return True
-        print("❌ HTTP", resp.code)
         return False
 
     if isinstance(resp, Exception):
         return False
 
-    try:
-        data = json.loads(resp)
-    except Exception as e:
-        print("❌ Błąd JSON:", e)
-        return False
-
-    ok = True
+    data = json.loads(resp)
     for entry in data:
-        if not process_table_entry(entry):
-            ok = False
+        process_table_entry(entry)
 
-    return ok
+    return True
 
 # =========================
 # MAIN
@@ -231,20 +206,15 @@ def fetch_today(today: date):
 
 def main():
     ensure_base_dir()
+    today = datetime.now(ZoneInfo(TZ)).date()
 
-    now = datetime.now(ZoneInfo(TZ))
-    today = now.date()
+    if not os.path.exists(BACKFILL_MARKER):
+        backfill()
+    else:
+        print("✔ Backfill już wykonany")
 
-    success = True
-
-    if START_DATE <= today:
-        if not backfill(START_DATE, today):
-            success = False
-
-    if not fetch_today(today):
-        success = False
-
-    sys.exit(0 if success else 1)
+    fetch_today(today)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
