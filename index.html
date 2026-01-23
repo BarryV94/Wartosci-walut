@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Catalog — exc/ (universal)</title>
+  <style>
+    :root{--bg:#f6f7fb;--card:#fff;--muted:#6b7280;--accent:#2563eb}
+    body{font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;padding:32px;background:var(--bg);color:#111}
+    .wrap{max-width:980px;margin:0 auto}
+    header{display:flex;align-items:center;gap:16px;margin-bottom:18px}
+    h1{font-size:20px;margin:0}
+    p.lead{margin:0;color:var(--muted)}
+    .card{background:var(--card);padding:14px;border-radius:12px;box-shadow:0 6px 18px rgba(17,24,39,0.06)}
+    .controls{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+    input[type=search], input[type=text]{flex:1;padding:8px 10px;border-radius:8px;border:1px solid #e6e9ef}
+    select, button{padding:8px;border-radius:8px;border:1px solid #e6e9ef;background:white}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px 8px;text-align:left;border-bottom:1px solid #f1f3f7}
+    th{color:var(--muted);font-size:13px}
+    a.file{color:var(--accent);text-decoration:none}
+    .meta{color:var(--muted);font-size:13px}
+    .empty{padding:28px;text-align:center;color:var(--muted)}
+    .badge{background:#eef2ff;color:#3730a3;padding:4px 8px;border-radius:999px;font-size:12px}
+    .small{font-size:13px;color:var(--muted)}
+    .row{display:flex;gap:8px}
+    .muted{color:var(--muted)}
+    .tag{font-size:12px;background:#f3f4f6;border-radius:6px;padding:6px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Files from <span class="small">exc/</span> — <span id="repoTag" class="badge">(not detected)</span></h1>
+        <p class="lead">Universal index — upload this file to any GitHub repository and it will show files from the repository's <code>exc/</code> folder. You can also force the repository using URL parameters.</p>
+      </div>
+    </header>
+
+    <div class="card">
+      <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:12px">
+        <div class="row">
+          <input id="ownerInput" type="text" placeholder="owner (e.g. BarryV94) — optional" />
+          <input id="repoInput" type="text" placeholder="repo (e.g. MTG) — optional" />
+          <input id="branchInput" type="text" placeholder="branch (e.g. main) — optional" />
+          <button id="applyBtn">Load</button>
+        </div>
+        <div class="row">
+          <input id="q" type="search" placeholder="Filter by name... (e.g. price)" />
+          <select id="sort">
+            <option value="name">Sort: name ↑</option>
+            <option value="name_desc">Sort: name ↓</option>
+            <option value="size">Sort: size ↓</option>
+          </select>
+          <label class="tag"><input id="includeSub" type="checkbox" checked /> include subfolders</label>
+          <div id="count" class="small">—</div>
+        </div>
+      </div>
+
+      <div id="listcontainer"></div>
+    </div>
+  </div>
+
+  <script>
+    // Helpers
+    const qs = (s) => document.querySelector(s);
+    const ownerFromSubdomain = (host) => {
+      // host like 'username.github.io'
+      if(!host.endsWith('.github.io')) return null;
+      return host.split('.github.io')[0];
+    }
+
+    function parseRepoFromLocation(){
+      const url = new URL(window.location.href);
+      const params = url.searchParams;
+      const pOwner = params.get('owner');
+      const pRepo = params.get('repo');
+      const pBranch = params.get('branch');
+      if(pOwner && pRepo) return {owner:pOwner, repo:pRepo, branch:pBranch || null, detectedBy:'query'};
+
+      // raw.githubusercontent.com path: /OWNER/REPO/BRANCH/...
+      if(location.hostname === 'raw.githubusercontent.com'){
+        const parts = location.pathname.split('/').filter(Boolean);
+        if(parts.length >= 3) return {owner:parts[0], repo:parts[1], branch:parts[2], detectedBy:'raw'};
+      }
+
+      // GitHub Pages: OWNER.github.io/REPO/
+      const ownerSub = ownerFromSubdomain(location.hostname);
+      if(ownerSub){
+        const parts = location.pathname.split('/').filter(Boolean);
+        if(parts.length >= 1){
+          const repo = parts[0];
+          return {owner:ownerSub, repo:repo, branch:null, detectedBy:'gh-pages'};
+        }
+      }
+
+      // GitHub pages user page (owner.github.io without repo) — treat repo as empty
+      if(ownerSub && (location.pathname === '/' || location.pathname === '')){
+        return {owner:ownerSub, repo:null, branch:null, detectedBy:'gh-pages-root'};
+      }
+
+      return {owner:null, repo:null, branch:null, detectedBy:null};
+    }
+
+    // Get repo info (default branch) and then tree
+    async function fetchRepoDefaultBranch(owner, repo){
+      const metaUrl = `https://api.github.com/repos/${owner}/${repo}`;
+      const res = await fetch(metaUrl);
+      if(!res.ok) throw new Error(`GitHub repo meta error: ${res.status} ${res.statusText}`);
+      const meta = await res.json();
+      return meta.default_branch || 'main';
+    }
+
+    async function fetchGitTree(owner, repo, branch){
+      const treeUrl = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
+      const res = await fetch(treeUrl);
+      if(!res.ok) throw new Error(`GitHub tree error: ${res.status} ${res.statusText}`);
+      const data = await res.json();
+      if(!data.tree) return [];
+      return data.tree.filter(item => item.type === 'blob');
+    }
+
+    function extIcon(ext){
+      if(!ext) return '📄';
+      const map = {md:'📘',pdf:'📕',json:'🗄️',csv:'🧾',png:'🖼️',jpg:'🖼️',jpeg:'🖼️',gif:'🖼️',zip:'📦',yml:'🧩',yaml:'🧩',html:'🌐',htm:'🌐',txt:'📄'};
+      return map[ext.toLowerCase()] || '📄';
+    }
+
+    function renderTable(files, owner, repo, branch){
+      const container = qs('#listcontainer');
+      if(files.length === 0){
+        container.innerHTML = '<div class="empty">No files found in <code>exc/</code> (or repo not found).</div>';
+        qs('#count').textContent = '0 files';
+        return;
+      }
+
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      thead.innerHTML = '<tr><th>File</th><th>Path</th><th class="small">Size</th></tr>';
+      table.appendChild(thead);
+      const tbody = document.createElement('tbody');
+
+      files.forEach(f => {
+        const row = document.createElement('tr');
+        const name = f.path.replace(/^docs\//,'');
+        const ext = (name.includes('.')? name.split('.').pop() : '');
+        const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${f.path}`;
+        const ghUrl = `https://github.com/${owner}/${repo}/blob/${branch}/${f.path}`;
+
+        row.innerHTML = `\
+          <td><span title="${ext}">${extIcon(ext)}</span> <a class="file" href="${rawUrl}" target="_blank" rel="noopener">${name}</a>\
+            <div class="meta"><a href="${ghUrl}" target="_blank" rel="noopener">(view on GitHub)</a></div>\
+          </td>\
+          <td class="small">${f.path}</td>\
+          <td class="small">${f.size ? f.size + ' B' : '—'}</td>\
+        `;
+        tbody.appendChild(row);
+      });
+
+      table.appendChild(tbody);
+      container.innerHTML = '';
+      container.appendChild(table);
+      qs('#count').textContent = `${files.length} files`;
+    }
+
+    // Main loader
+    (async function(){
+      const parsed = parseRepoFromLocation();
+      const ownerInput = qs('#ownerInput');
+      const repoInput = qs('#repoInput');
+      const branchInput = qs('#branchInput');
+      const applyBtn = qs('#applyBtn');
+
+      // Pre-fill inputs where possible
+      if(parsed.owner) ownerInput.value = parsed.owner;
+      if(parsed.repo) repoInput.value = parsed.repo;
+      if(parsed.branch) branchInput.value = parsed.branch;
+
+      function setRepoTag(owner, repo, branch, detectedBy){
+        const tag = owner && repo ? `${owner}/${repo}${branch?('/'+branch):''}` : '(not detected)';
+        qs('#repoTag').textContent = tag;
+        qs('#repoTag').title = detectedBy ? `detected by: ${detectedBy}` : '';
+      }
+
+      async function loadFromInputs(){
+        const owner = ownerInput.value.trim() || null;
+        const repo = repoInput.value.trim() || null;
+        let branch = branchInput.value.trim() || null;
+        if(!owner || !repo){
+          qs('#listcontainer').innerHTML = '<div class="empty">Enter owner and repo above and click <strong>Load</strong>.</div>';
+          setRepoTag(owner,repo,branch,null);
+          return;
+        }
+        setRepoTag(owner,repo,branch,'manual');
+
+        try{
+          // determine branch if not provided
+          if(!branch){
+            branch = await fetchRepoDefaultBranch(owner, repo);
+            branchInput.value = branch;
+            setRepoTag(owner,repo,branch,'default_branch');
+          }
+
+          const tree = await fetchGitTree(owner, repo, branch);
+          // filter exc/
+          const includeSub = qs('#includeSub').checked;
+          let files = tree.filter(item => item.path.startsWith('exc/'));
+          if(!includeSub){
+            files = files.filter(item => {
+              const p = item.path.replace(/^docs\//,'');
+              return p && !p.includes('/');
+            });
+          }
+          const q = qs('#q').value.trim().toLowerCase();
+          if(q){
+            files = files.filter(f => f.path.toLowerCase().includes(q));
+          }
+
+          // sort
+          const sortVal = qs('#sort').value;
+          if(sortVal === 'name') files.sort((a,b)=> a.path.localeCompare(b.path));
+          else if(sortVal === 'name_desc') files.sort((a,b)=> b.path.localeCompare(a.path));
+          else if(sortVal === 'size') files.sort((a,b)=> (b.size||0) - (a.size||0));
+
+          renderTable(files, owner, repo, branch);
+        }catch(e){
+          qs('#listcontainer').innerHTML = `<div class="empty">Error: ${e.message}</div>`;
+          console.error(e);
+          qs('#count').textContent = 'Error';
+        }
+      }
+
+      // initial attempt: if parsed owner+repo available, load
+      if(parsed.owner && parsed.repo){
+        ownerInput.value = parsed.owner;
+        repoInput.value = parsed.repo;
+        branchInput.value = parsed.branch || '';
+        setRepoTag(parsed.owner, parsed.repo, parsed.branch || '(choose)');
+        await loadFromInputs();
+      }else{
+        qs('#listcontainer').innerHTML = '<div class="empty">No repository detected automatically. Enter owner and repo above and click <strong>Load</strong>.</div>';
+        setRepoTag(null,null,null,null);
+      }
+
+      // events
+      applyBtn.addEventListener('click', loadFromInputs);
+      qs('#q').addEventListener('input', loadFromInputs);
+      qs('#sort').addEventListener('change', loadFromInputs);
+      qs('#includeSub').addEventListener('change', loadFromInputs);
+
+    })();
+  </script>
+</body>
+</html>
