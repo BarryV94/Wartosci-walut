@@ -1,44 +1,57 @@
 name: Update NBP Rates
 
+# Uruchamiaj codziennie o 13:00 czasu Warszawy (UTC+1 lub UTC+2 w lecie)
 on:
   schedule:
-    # Codziennie o 12:00 UTC (09:00 w Warszawie)
-    - cron: "0 12 * * *"
+    - cron: "0 12 * * *"  # 12:00 UTC = 13:00 CET (zimą)
   workflow_dispatch:
+
+# Potrzebne uprawnienia do pushowania
 permissions:
   contents: write
+
 jobs:
   update-nbp-rates:
     runs-on: ubuntu-latest
 
     steps:
+      # Pobranie repozytorium
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # potrzebne do pełnego pull/rebase
+          fetch-depth: 0
 
+      # Python do uruchomienia skryptu
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
+      # (Opcjonalne) instalowanie dodatkowych zależności
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
 
+      # Uruchomienie skryptu pobierającego kursy
       - name: Run NBP fetch script
         run: |
           python scripts/save_nbp_rates.py
 
-      - name: Configure Git for commit
+      # Konfiguracja Git do commitów
+      - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Commit changes
+      # Commit i push zmian tylko jeśli są nowe pliki/zmiany
+      - name: Commit changes if any
         run: |
           git add docs/exc
           git diff --cached --quiet || git commit -m "Update NBP rates"
-      
+
+      # Push przy użyciu GITHUB_TOKEN
       - name: Push changes
-        run: git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
