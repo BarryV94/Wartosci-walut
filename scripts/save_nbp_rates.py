@@ -79,8 +79,9 @@ return path
 
 
 def path_for_date(d: date):
-base = _pick_target_dir()
-return os.path.join(base, d.strftime("%d_%m_%Y.json"))("%d_%m_%Y.json"))
+    base = _pick_target_dir()
+    filename = d.strftime("%d_%m_%Y.json")
+    return os.path.join(base, filename)
 
 
 
