@@ -23,6 +23,7 @@ START_DATE = date(2021, 1, 1)
 CHUNK_DAYS = 93
 
 BACKFILL_MARKER = os.path.join(BASE_OUT_DIR, ".backfill_done")
+LAST_MARKER = os.path.join(BASE_OUT_DIR, ".last")
 
 BASE_TABLE_URL = (
     "https://api.nbp.pl/api/exchangerates/tables/A/"
@@ -116,6 +117,17 @@ def http_get(url):
         return e
 
 # =========================
+# LAST MARKER
+# =========================
+
+def update_last_marker(path):
+    try:
+        with open(LAST_MARKER, "w", encoding="utf-8") as f:
+            f.write(path)
+    except Exception as e:
+        print("❌ Błąd zapisu .last:", e)
+
+# =========================
 # NBP
 # =========================
 
@@ -127,6 +139,7 @@ def process_table_entry(entry):
     out_path = path_for_date(d)
 
     if os.path.exists(out_path):
+        update_last_marker(out_path)  # aktualizuj też .last jeśli plik już istnieje
         return True
 
     payload = {
@@ -141,7 +154,10 @@ def process_table_entry(entry):
         ],
     }
 
-    return write_json_atomic(out_path, payload)
+    if write_json_atomic(out_path, payload):
+        update_last_marker(out_path)
+        return True
+    return False
 
 
 def fetch_range(start_d: date, end_d: date):
