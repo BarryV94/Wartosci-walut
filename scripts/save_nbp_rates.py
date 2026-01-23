@@ -45,7 +45,6 @@ HEADERS = {
 def ensure_base_dir():
     os.makedirs(BASE_OUT_DIR, exist_ok=True)
 
-
 def existing_subdirs():
     result = []
     for name in os.listdir(BASE_OUT_DIR):
@@ -54,10 +53,8 @@ def existing_subdirs():
             result.append(int(name))
     return sorted(result)
 
-
 def pick_target_dir():
     subs = existing_subdirs()
-
     if not subs:
         target = 1
     else:
@@ -65,11 +62,9 @@ def pick_target_dir():
         last_path = os.path.join(BASE_OUT_DIR, str(last))
         count = len([f for f in os.listdir(last_path) if f.endswith(".json")])
         target = last if count < MAX_FILES_PER_DIR else last + 1
-
     path = os.path.join(BASE_OUT_DIR, str(target))
     os.makedirs(path, exist_ok=True)
     return path
-
 
 def path_for_date(d: date):
     base = pick_target_dir()
@@ -102,7 +97,6 @@ def write_json_atomic(path, data):
             pass
         return False
 
-
 def http_get(url):
     req = urllib.request.Request(url, headers=HEADERS)
     try:
@@ -117,13 +111,14 @@ def http_get(url):
         return e
 
 # =========================
-# LAST MARKER
+# LAST MARKER (HISTORIA)
 # =========================
 
-def update_last_marker(path):
+def append_last_marker(path):
     try:
-        with open(LAST_MARKER, "w", encoding="utf-8") as f:
-            f.write(path)
+        with open(LAST_MARKER, "a", encoding="utf-8") as f:
+            now_str = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{now_str}: {path}\n")
     except Exception as e:
         print("❌ Błąd zapisu .last:", e)
 
@@ -139,7 +134,7 @@ def process_table_entry(entry):
     out_path = path_for_date(d)
 
     if os.path.exists(out_path):
-        update_last_marker(out_path)  # aktualizuj też .last jeśli plik już istnieje
+        append_last_marker(out_path)
         return True
 
     payload = {
@@ -155,10 +150,9 @@ def process_table_entry(entry):
     }
 
     if write_json_atomic(out_path, payload):
-        update_last_marker(out_path)
+        append_last_marker(out_path)
         return True
     return False
-
 
 def fetch_range(start_d: date, end_d: date):
     url = BASE_TABLE_URL.format(
@@ -166,54 +160,41 @@ def fetch_range(start_d: date, end_d: date):
         end=end_d.isoformat()
     )
     resp = http_get(url)
-
     if isinstance(resp, Exception):
         return None
-
     try:
         return json.loads(resp)
     except Exception:
         return None
 
-
 def backfill():
     print("🔁 BACKFILL od 2021")
     cur = START_DATE
     today = date.today()
-
     while cur <= today:
         chunk_end = min(cur + timedelta(days=CHUNK_DAYS - 1), today)
         data = fetch_range(cur, chunk_end)
-
         if data:
             for entry in data:
                 process_table_entry(entry)
-
         cur = chunk_end + timedelta(days=1)
-
     with open(BACKFILL_MARKER, "w") as f:
         f.write(datetime.utcnow().isoformat())
-
     print("✅ BACKFILL ZAKOŃCZONY")
-
 
 def fetch_today(today: date):
     url = SINGLE_DAY_URL.format(date=today.isoformat())
     resp = http_get(url)
-
     if isinstance(resp, urllib.error.HTTPError):
         if resp.code == 404:
             print("ℹ Brak kursu (weekend/święto)")
             return True
         return False
-
     if isinstance(resp, Exception):
         return False
-
     data = json.loads(resp)
     for entry in data:
         process_table_entry(entry)
-
     return True
 
 # =========================
@@ -223,15 +204,12 @@ def fetch_today(today: date):
 def main():
     ensure_base_dir()
     today = datetime.now(ZoneInfo(TZ)).date()
-
     if not os.path.exists(BACKFILL_MARKER):
         backfill()
     else:
         print("✔ Backfill już wykonany")
-
     fetch_today(today)
     sys.exit(0)
-
 
 if __name__ == "__main__":
     main()
