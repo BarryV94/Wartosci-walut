@@ -1,0 +1,74 @@
+name: Dispatch Update NBP Rates to all repos
+
+on:
+  schedule:
+    - cron: '0 11 * * *'   # przykładowo: codziennie 11:00 UTC (dopasuj wg potrzeby)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check token
+        run: |
+          if [ -z "${{ secrets.REPO_DISPATCH_TOKEN }}" ]; then
+            echo "Secret REPO_DISPATCH_TOKEN is not set!"; exit 1
+          fi
+      - name: Trigger workflows in target repos
+        env:
+          TOKEN: ${{ secrets.REPO_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          repos=(
+            "BarryV94/MTG"
+            "BarryV94/Battlespiritsaga"
+            "BarryV94/Dragonballsuper"
+            "BarryV94/Pokemon"
+            "BarryV94/Accessories"
+            "BarryV94/Cardfightvanguard"
+            "BarryV94/Digimon"
+            "BarryV94/Dragonborne"
+            "BarryV94/Finalfantasy"
+            "BarryV94/Fleshandblood"
+            "BarryV94/Forceofwill"
+            "BarryV94/Lorcana"
+            "BarryV94/Mylittlepony"
+            "BarryV94/Onepiece"
+            "BarryV94/Riftbound"
+            "BarryV94/Starwarsdestiny"
+            "BarryV94/Starwarsunlimited"
+            "BarryV94/Thespoils"
+            "BarryV94/Wei-schwarz"
+            "BarryV94/Wowtcg"
+            "BarryV94/Yugioh"
+          )
+
+          # nazwa pliku workflow w docelowych repo (upewnij się, że to się zgadza)
+          workflow_file="update-nbp-rates.yml"
+          ref="main"   # branch, na którym chcesz uruchomić workflow w docelowym repo
+
+          failures=0
+          for r in "${repos[@]}"; do
+            echo "Triggering $r -> workflow ${workflow_file} on ref ${ref} ..."
+            resp=$(curl -s -o /dev/stderr -w "%{http_code}" -X POST \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token ${TOKEN}" \
+              https://api.github.com/repos/${r}/actions/workflows/${workflow_file}/dispatches \
+              -d "{\"ref\":\"${ref}\"}")
+            # oczekiwany kod sukcesu to 204 No Content
+            if [ "$resp" != "204" ]; then
+              echo " -> FAILED for ${r} (http ${resp})"
+              failures=$((failures+1))
+            else
+              echo " -> OK"
+            fi
+            # krótkie opóźnienie by nie trafić od razu na rate limit
+            sleep 1
+          done
+
+          if [ "$failures" -ne 0 ]; then
+            echo "There were ${failures} failures."; exit 1
+          fi
