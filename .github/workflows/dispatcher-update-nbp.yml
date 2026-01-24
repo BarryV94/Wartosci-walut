@@ -23,31 +23,31 @@ jobs:
         run: |
           set -euo pipefail
           repos=(
-            "MTG"
-            "Battlespiritsaga"
-            "Dragonballsuper"
-            "Pokemon"
-            "Accessories"
-            "Cardfightvanguard"
-            "Digimon"
-            "Dragonborne"
-            "Finalfantasy"
-            "Fleshandblood"
-            "Forceofwill"
-            "Lorcana"
-            "Mylittlepony"
-            "Onepiece"
-            "Riftbound"
-            "Starwarsdestiny"
-            "Starwarsunlimited"
-            "Thespoils"
-            "Wei-schwarz"
-            "Wowtcg"
-            "Yugioh"
+            "BarryV94/MTG"
+            "BarryV94/Battlespiritsaga"
+            "BarryV94/Dragonballsuper"
+            "BarryV94/Pokemon"
+            "BarryV94/Accessories"
+            "BarryV94/Cardfightvanguard"
+            "BarryV94/Digimon"
+            "BarryV94/Dragonborne"
+            "BarryV94/Finalfantasy"
+            "BarryV94/Fleshandblood"
+            "BarryV94/Forceofwill"
+            "BarryV94/Lorcana"
+            "BarryV94/Mylittlepony"
+            "BarryV94/Onepiece"
+            "BarryV94/Riftbound"
+            "BarryV94/Starwarsdestiny"
+            "BarryV94/Starwarsunlimited"
+            "BarryV94/Thespoils"
+            "BarryV94/Wei-schwarz"
+            "BarryV94/Wowtcg"
+            "BarryV94/Yugioh"
           )
 
           # nazwa pliku workflow w docelowych repo (upewnij się, że to się zgadza)
-          workflow_file="update-nbp-rates.yml"
+          workflow_file="save-price-guide.yml"
           ref="main"   # branch, na którym chcesz uruchomić workflow w docelowym repo
 
           failures=0
