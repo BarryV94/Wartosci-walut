@@ -93,6 +93,7 @@ def http_get(url):
             charset = resp.headers.get_content_charset() or "utf-8"
             return raw.decode(charset)
     except urllib.error.HTTPError as e:
+        # zwracamy obiekt HTTPError, caller sprawdza kod
         return e
     except Exception as e:
         print("❌ HTTP:", e)
@@ -148,7 +149,7 @@ def fetch_range(start_d: date, end_d: date):
         return None
 
 def backfill():
-    print("🔁 BACKFILL od 2021")
+    print("🔁 BACKFILL od", START_DATE.isoformat())
     cur = START_DATE
     today = date.today()
     while cur <= today:
@@ -162,19 +163,50 @@ def backfill():
         f.write(datetime.utcnow().isoformat())
     print("✅ BACKFILL ZAKOŃCZONY")
 
-def fetch_today(today: date):
-    url = SINGLE_DAY_URL.format(date=today.isoformat())
-    resp = http_get(url)
-    if isinstance(resp, urllib.error.HTTPError):
-        if resp.code == 404:
-            print("ℹ Brak kursu (weekend/święto)")
+def fetch_recent_and_today(today: date, lookback_days: int = 7):
+    """
+    Najpierw spróbuj pobrać tabelę dla zakresu (today-lookback_days .. today).
+    Jeśli to nic nie zwróci (np. API odpowiedziało 404), spróbuj pojedyncze dni
+    cofając się od today do today-lookback_days (zachowując obsługę 404).
+    Zwraca True jeśli wykonał się poprawnie (nawet jeśli nic nie było do zapisania).
+    """
+    start = today - timedelta(days=lookback_days - 1)
+    print(f"🔎 Próba pobrania zakresu {start.isoformat()} — {today.isoformat()}")
+    data = fetch_range(start, today)
+    if data:
+        print(f"ℹ Znalazłem {len(data)} wpisów w zakresie, przetwarzam...")
+        for entry in data:
+            process_table_entry(entry)
+        return True
+
+    # jeśli zakres nic nie zwrócił, spróbuj po kolei — od dziś wstecz
+    print("ℹ Zakres nic nie zwrócił — próbuję pojedynczych dni wstecz")
+    for i in range(0, lookback_days):
+        d = today - timedelta(days=i)
+        url = SINGLE_DAY_URL.format(date=d.isoformat())
+        resp = http_get(url)
+        if isinstance(resp, urllib.error.HTTPError):
+            # 404 -> brak tabeli w tym dniu (weekend/święto)
+            if resp.code == 404:
+                print(f"ℹ {d.isoformat()}: brak (404)")
+                continue
+            print(f"❌ Błąd HTTP dla {d.isoformat()}: {resp}")
+            return False
+        if isinstance(resp, Exception):
+            print("❌ Błąd przy pobieraniu:", resp)
+            return False
+        try:
+            data = json.loads(resp)
+        except Exception as e:
+            print("❌ Nie udało się zdekodować JSON:", e)
+            return False
+        if data:
+            print(f"ℹ {d.isoformat()}: znaleziono dane, przetwarzam...")
+            for entry in data:
+                process_table_entry(entry)
             return True
-        return False
-    if isinstance(resp, Exception):
-        return False
-    data = json.loads(resp)
-    for entry in data:
-        process_table_entry(entry)
+
+    print(f"ℹ Brak kursów w ostatnich {lookback_days} dniach (weekend/święta).")
     return True
 
 def main():
@@ -184,7 +216,8 @@ def main():
         backfill()
     else:
         print("✔ Backfill już wykonany")
-    fetch_today(today)
+    # spróbuj pobrać dane dla ostatnich dni (zwykle złapie też dzisiejsze, jeśli istnieją)
+    fetch_recent_and_today(today, lookback_days=7)
     sys.exit(0)
 
 if __name__ == "__main__":
