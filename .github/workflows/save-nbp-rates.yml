@@ -2,7 +2,7 @@ name: Update NBP Rates
 
 on:
   schedule:
-    - cron: "0 12 * * *"  # 12:00 UTC = 13:00 CET (zimą)
+    - cron: "0 14 * * *"  # 12:00 UTC = 13:00 CET (zimą)
   workflow_dispatch:
 
 permissions:
