@@ -15,7 +15,7 @@ TZ = "Europe/Warsaw"
 BASE_OUT_DIR = os.path.join("docs", "exc")
 MAX_FILES_PER_DIR = 999
 
-START_DATE = date(2016, 1, 1)
+START_DATE = date(2002, 1, 1)
 CHUNK_DAYS = 93
 
 BACKFILL_MARKER = os.path.join(BASE_OUT_DIR, ".backfill_done")
