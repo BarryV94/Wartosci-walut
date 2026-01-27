@@ -15,7 +15,10 @@ TZ = "Europe/Warsaw"
 BASE_OUT_DIR = os.path.join("docs", "exc")
 MAX_FILES_PER_DIR = 999
 
-START_DATE = date(2002, 1, 1)
+# Domyślny rok startowy: 2002. Możesz nadpisać ustawiając zmienną środowiskową START_YEAR
+START_YEAR = int(os.getenv("START_YEAR", "2002"))
+START_DATE = date(START_YEAR, 1, 1)
+
 CHUNK_DAYS = 93
 
 BACKFILL_MARKER = os.path.join(BASE_OUT_DIR, ".backfill_done")
