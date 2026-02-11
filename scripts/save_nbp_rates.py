@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 # scripts/save_nbp_rates.py
-
-"""
-Pobiera tabele kursów z API NBP i zapisuje je do plików JSON w katalogu docs/exc.
-
-Zmiany względem oryginału:
-- Domyślny START_YEAR = 2002 (można nadpisać zmienną środowiskową START_YEAR)
-- Bezpieczniejsze przetwarzanie wpisów (obsługa brakujących/pustych pól w `rates`)
-- Zapis problematycznych wpisów do docs/exc/bad_entries zamiast przerywania backfilla
-- http_get z retry/backoff (dla transient errors)
-
-Uruchomienie przykładowe:
-
-    START_YEAR=2002 python scripts/save_nbp_rates.py
-
-"""
+# Zmieniona wersja — zapisuje pliki do docs/exc/<YEAR>/<dd_mm_YYYY>.json.gz
 
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -25,11 +11,11 @@ import os
 import sys
 import tempfile
 import time
+import gzip
 
 TZ = "Europe/Warsaw"
 
 BASE_OUT_DIR = os.path.join("docs", "exc")
-MAX_FILES_PER_DIR = 999
 
 # Domyślny rok startowy: 2002. Nadpisz przez START_YEAR w env, np. START_YEAR=2010
 START_YEAR = int(os.getenv("START_YEAR", "2002"))
@@ -59,59 +45,54 @@ def ensure_base_dir():
     os.makedirs(BASE_OUT_DIR, exist_ok=True)
 
 
-def existing_subdirs():
-    result = []
-    if not os.path.isdir(BASE_OUT_DIR):
-        return result
-    for name in os.listdir(BASE_OUT_DIR):
-        path = os.path.join(BASE_OUT_DIR, name)
-        if os.path.isdir(path) and name.isdigit():
-            try:
-                result.append(int(name))
-            except Exception:
-                continue
-    return sorted(result)
-
-
-def pick_target_dir():
-    subs = existing_subdirs()
-    if not subs:
-        target = 1
-    else:
-        last = subs[-1]
-        last_path = os.path.join(BASE_OUT_DIR, str(last))
-        try:
-            count = len([f for f in os.listdir(last_path) if f.endswith(".json")])
-        except Exception:
-            count = 0
-        target = last if count < MAX_FILES_PER_DIR else last + 1
-    path = os.path.join(BASE_OUT_DIR, str(target))
-    os.makedirs(path, exist_ok=True)
-    return path
+def append_last_marker(path):
+    try:
+        os.makedirs(os.path.dirname(LAST_MARKER), exist_ok=True)
+        with open(LAST_MARKER, "a", encoding="utf-8") as f:
+            now_str = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{now_str}: {path}\n")
+    except Exception as e:
+        print("❌ Błąd zapisu .last:", e)
 
 
 def path_for_date(d: date):
-    base = pick_target_dir()
-    return os.path.join(base, d.strftime("%d_%m_%Y.json"))
+    """
+    Zwraca ścieżkę docs/exc/<YEAR>/<dd_mm_YYYY>.json.gz i tworzy katalog YEAR jeśli potrzeba.
+    """
+    year_dir = os.path.join(BASE_OUT_DIR, str(d.year))
+    os.makedirs(year_dir, exist_ok=True)
+    filename = d.strftime("%d_%m_%Y.json.gz")
+    return os.path.join(year_dir, filename)
 
 
-def write_json_atomic(path, data):
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".json",
-        dir=os.path.dirname(path)
-    )
+def write_json_gz_atomic(path, data):
+    """
+    Zapisuje JSON skompresowany gzip atomowo (tmp -> os.replace).
+    Zwraca True jeśli OK.
+    """
+    dirn = os.path.dirname(path)
+    os.makedirs(dirn, exist_ok=True)
+    # przygotuj zawartość
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(json.dumps(
-                data,
-                ensure_ascii=False,
-                separators=(",", ":")
-            ).encode("utf-8"))
+        payload_bytes = json.dumps(
+            data,
+            ensure_ascii=False,
+            separators=(",", ":")
+        ).encode("utf-8")
+    except Exception as e:
+        print("❌ Błąd serializacji JSON:", e)
+        return False
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".json.gz", dir=dirn)
+    os.close(fd)
+    try:
+        with gzip.open(tmp_path, "wb") as gz:
+            gz.write(payload_bytes)
         os.replace(tmp_path, path)
         print("✅ Zapisano:", path)
         return True
     except Exception as e:
-        print("❌ Błąd zapisu:", e)
+        print("❌ Błąd zapisu (gzip):", e)
         try:
             os.remove(tmp_path)
         except Exception:
@@ -152,16 +133,6 @@ def http_get(url, retries=3, backoff_base=0.5, timeout=60):
             return e
 
 
-def append_last_marker(path):
-    try:
-        os.makedirs(os.path.dirname(LAST_MARKER), exist_ok=True)
-        with open(LAST_MARKER, "a", encoding="utf-8") as f:
-            now_str = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"{now_str}: {path}\n")
-    except Exception as e:
-        print("❌ Błąd zapisu .last:", e)
-
-
 # defensywna funkcja przetwarzajaca pojedyńczy wpis
 def process_table_entry(entry):
     # defensywne pobranie pól
@@ -195,7 +166,6 @@ def process_table_entry(entry):
             print("⚠ Nieoczekiwany element w rates (nie dict) — pomijam:", r)
             continue
 
-        # zbieramy dostępne pola (obsługa mid oraz bid/ask)
         code = r.get("code")
         currency = r.get("currency") or r.get("name") or None
 
@@ -211,7 +181,6 @@ def process_table_entry(entry):
         if "ask" in r:
             rate_entry["ask"] = r["ask"]
 
-        # jeśli nie znaleziono nic sensownego — logujemy i pomijamy
         if not rate_entry:
             print("⚠ Pusty/nieużyteczny rate_entry — pomijam:", r)
             continue
@@ -223,7 +192,7 @@ def process_table_entry(entry):
         "rates": rates_list,
     }
 
-    if write_json_atomic(out_path, payload):
+    if write_json_gz_atomic(out_path, payload):
         append_last_marker(out_path)
         return True
     return False
@@ -285,12 +254,6 @@ def backfill():
 
 
 def fetch_recent_and_today(today: date, lookback_days: int = 7):
-    """
-    Najpierw spróbuj pobrać tabelę dla zakresu (today-lookback_days .. today).
-    Jeśli to nic nie zwróci (np. API odpowiedziało 404), spróbuj pojedyncze dni
-    cofając się od today do today-lookback_days (zachowując obsługę 404).
-    Zwraca True jeśli wykonał się poprawnie (nawet jeśli nic nie było do zapisania).
-    """
     start = today - timedelta(days=lookback_days - 1)
     print(f"🔎 Próba pobrania zakresu {start.isoformat()} — {today.isoformat()}")
     data = fetch_range(start, today)
@@ -300,7 +263,6 @@ def fetch_recent_and_today(today: date, lookback_days: int = 7):
             process_table_entry(entry)
         return True
 
-    # jeśli zakres nic nie zwrócił, spróbuj po kolei — od dziś wstecz
     print("ℹ Zakres nic nie zwrócił — próbuję pojedynczych dni wstecz")
     for i in range(0, lookback_days):
         d = today - timedelta(days=i)
@@ -338,7 +300,6 @@ def main():
         backfill()
     else:
         print("✔ Backfill już wykonany")
-    # spróbuj pobrać dane dla ostatnich dni (zwykle złapie też dzisiejsze, jeśli istnieją)
     fetch_recent_and_today(today, lookback_days=7)
     sys.exit(0)
 
