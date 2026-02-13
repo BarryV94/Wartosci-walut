@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # scripts/save_nbp_rates.py
-# Zmieniona wersja — zapisuje pliki do docs/exc/<YEAR>/<dd_mm_YYYY>.json.gz
+# Rozszerzona wersja z migracją plików umieszczonych w katalogach typu docs/exc/1, docs/exc/2, ...
 
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -12,6 +12,8 @@ import sys
 import tempfile
 import time
 import gzip
+import shutil
+import re
 
 TZ = "Europe/Warsaw"
 
@@ -38,6 +40,9 @@ SINGLE_DAY_URL = (
 HEADERS = {
     "User-Agent": "nbp-exchange-rates-fetcher/1.0"
 }
+
+DATE_FILENAME_RE = re.compile(r"^(\d{2})_(\d{2})_(\d{4})\.json\.gz$")
+
 
 # --- util
 
@@ -293,8 +298,108 @@ def fetch_recent_and_today(today: date, lookback_days: int = 7):
     return True
 
 
+# --- Nowa funkcja migracji
+
+def migrate_misplaced_files():
+    """
+    Przeszukuje BASE_OUT_DIR i przenosi pliki o nazwie dd_mm_YYYY.json.gz,
+    które leżą w katalogach nie-będących katalogami roku (np. '1', '2', '3', ...),
+    do katalogu docs/exc/<YYYY>/<dd_mm_YYYY>.json.gz
+
+    Zachowanie przy konflikcie:
+      - jeśli plik docelowy nie istnieje -> move
+      - jeśli istnieje i ma tę samą wielkość -> usuń źródło (uznajemy za duplikat)
+      - jeśli istnieje i różna wielkość -> przenieś źródło, dodając suffix "-conflict-<timestamp>"
+    """
+    print("🔧 Sprawdzam i migruję pliki z błędnych katalogów (jeśli występują)...")
+    if not os.path.isdir(BASE_OUT_DIR):
+        print("ℹ Brak katalogu bazowego, pomijam migrację.")
+        return
+
+    for entry in os.listdir(BASE_OUT_DIR):
+        entry_path = os.path.join(BASE_OUT_DIR, entry)
+        # Jeśli to katalog-rok (4 cyfry), pomiń
+        if not os.path.isdir(entry_path):
+            continue
+        if re.fullmatch(r"\d{4}", entry):
+            # katalog prawdopodobnie prawidłowy: "2023", "2024"
+            continue
+
+        # Przeszukujemy katalog entry_path w poszukiwaniu plików pasujących do nazwy daty
+        moved_any = False
+        for root, dirs, files in os.walk(entry_path):
+            for fname in files:
+                m = DATE_FILENAME_RE.match(fname)
+                if not m:
+                    continue
+                day, month, year = m.groups()
+                try:
+                    # validacja daty
+                    _ = date(int(year), int(month), int(day))
+                except Exception:
+                    print(f"⚠ Nieprawidłowa data w nazwie pliku {fname} — pomijam.")
+                    continue
+
+                src = os.path.join(root, fname)
+                dest_dir = os.path.join(BASE_OUT_DIR, year)
+                os.makedirs(dest_dir, exist_ok=True)
+                dest = os.path.join(dest_dir, fname)
+
+                if not os.path.exists(dest):
+                    try:
+                        shutil.move(src, dest)
+                        print(f"➡ Przeniesiono: {src} -> {dest}")
+                        moved_any = True
+                    except Exception as e:
+                        print(f"❌ Nie udało się przenieść {src} -> {dest}: {e}")
+                else:
+                    try:
+                        src_sz = os.path.getsize(src)
+                        dest_sz = os.path.getsize(dest)
+                        if src_sz == dest_sz:
+                            # duplikat -> usuń źródło
+                            os.remove(src)
+                            print(f"ℹ Duplikat (ten sam rozmiar) — usunięto źródło: {src}")
+                            moved_any = True
+                        else:
+                            ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                            new_name = f"{fname[:-7]}-conflict-{ts}.json.gz"  # fname[:-7] to dd_mm_YYYY
+                            new_dest = os.path.join(dest_dir, new_name)
+                            shutil.move(src, new_dest)
+                            print(f"⚠ Konflikt rozmiaru — przeniesiono jako: {new_dest}")
+                            moved_any = True
+                    except Exception as e:
+                        print(f"❌ Błąd przy obsłudze konfliktu dla {src}: {e}")
+
+        # po przejściu po katalogu spróbuj usunąć pusty katalogy
+        # (tylko jeśli emptiness; nie usuwamy katalogu jeśli coś pozostało)
+        for root, dirs, files in os.walk(entry_path, topdown=False):
+            # usuń pliki tymczasowe (opcjonalnie) — tu pomijamy
+            if not os.listdir(root):
+                try:
+                    os.rmdir(root)
+                    print(f"🧹 Usunięto pusty katalog: {root}")
+                except Exception:
+                    pass
+
+        if moved_any:
+            print(f"✅ Migracja z katalogu {entry_path} zakończona.")
+        else:
+            # brak plików do migracji
+            # (możemy usunąć puste katalogi powyżej, już zrobione)
+            pass
+
+    print("🔧 Migracja zakończona.")
+
+
 def main():
     ensure_base_dir()
+    # wykonaj migrację starych plików (jeśli jakieś są w niewłaściwych folderach)
+    try:
+        migrate_misplaced_files()
+    except Exception as e:
+        print("❌ Błąd podczas migracji plików:", e)
+
     today = datetime.now(ZoneInfo(TZ)).date()
     if not os.path.exists(BACKFILL_MARKER):
         backfill()
