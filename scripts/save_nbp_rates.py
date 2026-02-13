@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # scripts/save_nbp_rates.py
-# Rozszerzona wersja z migracją plików umieszczonych w katalogach typu docs/exc/1, docs/exc/2, ...
+# Wersja z migracją legacy (przenoszenie plików z katalogów typu docs/exc/1, docs/exc/4 itd.
+# do katalogów docs/exc/<YEAR>/ na podstawie nazwy pliku lub pola "date" w JSON)
+#
+# Zachowuje oryginalną funkcjonalność: backfill, fetch ostatnich dni, atomic gzip write.
 
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -12,8 +15,10 @@ import sys
 import tempfile
 import time
 import gzip
+import hashlib
 import shutil
 import re
+from typing import Optional
 
 TZ = "Europe/Warsaw"
 
@@ -41,10 +46,9 @@ HEADERS = {
     "User-Agent": "nbp-exchange-rates-fetcher/1.0"
 }
 
-DATE_FILENAME_RE = re.compile(r"^(\d{2})_(\d{2})_(\d{4})\.json\.gz$")
-
-
-# --- util
+# -------------------
+# Helper / I/O
+# -------------------
 
 def ensure_base_dir():
     os.makedirs(BASE_OUT_DIR, exist_ok=True)
@@ -105,6 +109,222 @@ def write_json_gz_atomic(path, data):
         return False
 
 
+def file_sha256(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def read_json_from_file(path) -> Optional[dict]:
+    """
+    Odczytuje JSON z pliku .json lub .json.gz i zwraca obiekt (lub None).
+    """
+    try:
+        if path.endswith(".gz"):
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                return json.load(f)
+        else:
+            with open(path, "rt", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print("⚠ Nie udało się odczytać JSON z", path, ":", e)
+        return None
+
+# -------------------
+# Legacy migration
+# -------------------
+
+FNAME_REGEX = re.compile(r"^(\d{2})_(\d{2})_(\d{4})(?:\.json|\.json\.gz)$")
+
+def migrate_legacy_structure():
+    """
+    Przenosi pliki z katalogów legacy (np. docs/exc/1, docs/exc/4, itp.) do katalogów z rokiem.
+    Zasady:
+      - Jeśli nazwa pliku zawiera dd_mm_YYYY -> używa tego YYYY.
+      - W przeciwnym razie próbuje odczytać JSON i wyciągnąć pole "date" (YYYY-MM-DD).
+      - W przypadku konfliktów porównuje sha256 i mtime:
+          * jeśli identyczne -> usuwa źródło
+          * jeśli różne i źródło nowsze -> archiwizuje stary target jako bak i zamienia
+          * jeśli różne i źródło starsze -> przenosi źródło jako file_conflict_<ts>.json(.gz)
+    """
+    print("🔧 Sprawdzam strukturę legacy w", BASE_OUT_DIR)
+    try:
+        entries = os.listdir(BASE_OUT_DIR)
+    except FileNotFoundError:
+        print("ℹ Brak katalogu", BASE_OUT_DIR)
+        return
+    for name in entries:
+        sub = os.path.join(BASE_OUT_DIR, name)
+        # pomijamy pliki markerów i katalogi-roki (czterocyfrowe)
+        if not os.path.isdir(sub):
+            continue
+        if re.fullmatch(r"\d{4}", name):
+            # już katalog roku -> OK
+            continue
+        # jeżeli katalog wygląda jak .something lub ma pliki które warto zostawić, nadal spróbujemy przenieść wszystko co pasuje
+        print(f"📂 Przetwarzam legacy katalog: {sub}")
+        try:
+            files = os.listdir(sub)
+        except Exception as e:
+            print("⚠ Nie mogę wymienić plików w", sub, ":", e)
+            continue
+        for fname in files:
+            src_path = os.path.join(sub, fname)
+            if not os.path.isfile(src_path):
+                # pomijamy podkatalogi (można rozszerzyć jeśli trzeba)
+                continue
+
+            # tylko pliki .json lub .json.gz
+            if not (fname.endswith(".json") or fname.endswith(".json.gz")):
+                print("ℹ Pomijam nierelewantny plik:", src_path)
+                continue
+
+            year = None
+            m = FNAME_REGEX.match(fname)
+            if m:
+                year = m.group(3)
+            else:
+                # próbuj z zawartości pliku
+                data = read_json_from_file(src_path)
+                if data:
+                    dstr = None
+                    # pola możliwe: "date", "effectiveDate", "effective_date"
+                    if isinstance(data, dict):
+                        dstr = data.get("date") or data.get("effectiveDate") or data.get("effective_date")
+                    # jeśli JSON jest tablicą (oryginalna tabela zwraca listę wpisów) -> weź pierwszy entry
+                    if not dstr and isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                        dstr = data[0].get("date") or data[0].get("effectiveDate") or data[0].get("effective_date")
+                    if dstr:
+                        # oczekujemy formatu YYYY-MM-DD lub podobnego
+                        try:
+                            parsed = datetime.strptime(dstr[:10], "%Y-%m-%d").date()
+                            year = str(parsed.year)
+                        except Exception:
+                            year = None
+
+            if not year:
+                # nie udało się ustalić roku -> przenieś do bad_entries w strukturze base_out_dir
+                bad_dir = os.path.join(BASE_OUT_DIR, "bad_legacy")
+                os.makedirs(bad_dir, exist_ok=True)
+                target = os.path.join(bad_dir, fname)
+                # unikamy nadpisania
+                if os.path.exists(target):
+                    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+                    target = os.path.join(bad_dir, f"{fname}.legacy_{ts}")
+                try:
+                    os.replace(src_path, target)
+                    print("⚠ Nieznany rok dla", src_path, "=> przeniesiono do", target)
+                except Exception as e:
+                    print("❌ Nie udało się przenieść", src_path, ":", e)
+                continue
+
+            # celowy katalog
+            target_dir = os.path.join(BASE_OUT_DIR, year)
+            os.makedirs(target_dir, exist_ok=True)
+            target_path = os.path.join(target_dir, fname)
+
+            # jeśli target nie istnieje -> przenieś atomowo
+            if not os.path.exists(target_path):
+                try:
+                    os.replace(src_path, target_path)
+                    print("→ Przeniesiono:", src_path, "=>", target_path)
+                except Exception as e:
+                    # próba kopiuj->usuwaj
+                    try:
+                        shutil.copy2(src_path, target_path)
+                        os.remove(src_path)
+                        print("→ Skopiowano(backup):", src_path, "=>", target_path)
+                    except Exception as e2:
+                        print("❌ Błąd przenoszenia", src_path, ":", e2)
+                continue
+
+            # target istnieje -> porównaj sha256
+            src_hash = file_sha256(src_path)
+            tgt_hash = file_sha256(target_path)
+            try:
+                src_mtime = os.path.getmtime(src_path)
+                tgt_mtime = os.path.getmtime(target_path)
+            except Exception:
+                src_mtime = None
+                tgt_mtime = None
+
+            if src_hash and tgt_hash and src_hash == tgt_hash:
+                # identyczne -> usuń źródło
+                try:
+                    os.remove(src_path)
+                    print("✔ Plik identyczny, usunięto źródło:", src_path)
+                except Exception as e:
+                    print("⚠ Nie udało się usunąć identycznego źródła:", src_path, e)
+                continue
+
+            # różne pliki -> jeśli źródło jest nowsze, zrób backup starego i przenieś
+            if src_mtime and tgt_mtime and src_mtime > tgt_mtime:
+                # backup starego targeta
+                bak_name = os.path.basename(target_path) + ".bak." + datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+                bak_path = os.path.join(target_dir, bak_name)
+                try:
+                    os.replace(target_path, bak_path)
+                    os.replace(src_path, target_path)
+                    print("⚠ Konflikt: stary target zbackupowany jako", bak_path, "— nowy plik przeniesiony jako", target_path)
+                except Exception as e:
+                    print("❌ Błąd przy zamianie plików (próba backup+replace):", e)
+                    # fallback: przenieś źródło z suffixem
+                    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+                    conflict_name = os.path.splitext(fname)[0] + f"_conflict_{ts}.json"
+                    if fname.endswith(".gz"):
+                        conflict_name += ".gz"
+                    conflict_path = os.path.join(target_dir, conflict_name)
+                    try:
+                        os.replace(src_path, conflict_path)
+                        print("⚠ Przeniesiono źródło jako konflikt:", conflict_path)
+                    except Exception as e2:
+                        print("❌ Nie udało się przenieść źródła konfliktowego:", e2)
+                continue
+            else:
+                # target jest nowszy lub nie mamy mtime -> przenieś źródło z sufiksem konfliktowym
+                ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+                base_no_ext = os.path.splitext(fname)[0]
+                if fname.endswith(".gz"):
+                    conflict_name = base_no_ext + f"_conflict_{ts}.json.gz"
+                else:
+                    conflict_name = base_no_ext + f"_conflict_{ts}.json"
+                conflict_path = os.path.join(target_dir, conflict_name)
+                try:
+                    os.replace(src_path, conflict_path)
+                    print("⚠ Target nowszy — przeniesiono źródło jako:", conflict_path)
+                except Exception as e:
+                    print("❌ Nie udało się przenieść konfliktowego źródła:", e)
+                    # ostatecznie spróbuj kopiować
+                    try:
+                        shutil.copy2(src_path, conflict_path)
+                        os.remove(src_path)
+                        print("⚠ Skopiowano źródło jako konflikt:", conflict_path)
+                    except Exception as e2:
+                        print("❌ Ostateczny błąd przenoszenia/kopii:", e2)
+
+        # po przeniesieniu plików spróbuj usunąć pusty katalog legacy
+        try:
+            remaining = os.listdir(sub)
+            if len(remaining) == 0:
+                os.rmdir(sub)
+                print("🗑 Usunięto pusty legacy katalog:", sub)
+            else:
+                print("ℹ Po migracji katalog zawiera nadal pliki (pozostawiam):", sub)
+        except Exception as e:
+            print("⚠ Nie udało się usunąć katalogu", sub, ":", e)
+
+    print("🔧 Migracja legacy zakończona.")
+
+
+# -------------------
+# HTTP + processing
+# -------------------
+
 # http_get z retry/backoff. Zwraca treść (string) lub obiekt urllib.error.HTTPError lub inny Exception
 def http_get(url, retries=3, backoff_base=0.5, timeout=60):
     attempt = 0
@@ -143,18 +363,18 @@ def process_table_entry(entry):
     # defensywne pobranie pól
     eff_date = None
     if isinstance(entry, dict):
-        eff_date = entry.get("effectiveDate") or entry.get("effective_date")
+        eff_date = entry.get("effectiveDate") or entry.get("effective_date") or entry.get("date")
         rates = entry.get("rates", []) if isinstance(entry, dict) else []
     else:
         print("⚠ Nieoczekiwany entry (nie dict) — pomijam:", entry)
         return False
 
     if not eff_date:
-        print("⚠ Brak pola effectiveDate w entry, pomijam:", entry)
+        print("⚠ Brak pola effectiveDate/date w entry, pomijam:", entry)
         return False
 
     try:
-        d = datetime.strptime(eff_date, "%Y-%m-%d").date()
+        d = datetime.strptime(eff_date[:10], "%Y-%m-%d").date()
     except Exception as e:
         print("❌ Nieprawidłowy format daty:", eff_date, e)
         return False
@@ -298,108 +518,16 @@ def fetch_recent_and_today(today: date, lookback_days: int = 7):
     return True
 
 
-# --- Nowa funkcja migracji
-
-def migrate_misplaced_files():
-    """
-    Przeszukuje BASE_OUT_DIR i przenosi pliki o nazwie dd_mm_YYYY.json.gz,
-    które leżą w katalogach nie-będących katalogami roku (np. '1', '2', '3', ...),
-    do katalogu docs/exc/<YYYY>/<dd_mm_YYYY>.json.gz
-
-    Zachowanie przy konflikcie:
-      - jeśli plik docelowy nie istnieje -> move
-      - jeśli istnieje i ma tę samą wielkość -> usuń źródło (uznajemy za duplikat)
-      - jeśli istnieje i różna wielkość -> przenieś źródło, dodając suffix "-conflict-<timestamp>"
-    """
-    print("🔧 Sprawdzam i migruję pliki z błędnych katalogów (jeśli występują)...")
-    if not os.path.isdir(BASE_OUT_DIR):
-        print("ℹ Brak katalogu bazowego, pomijam migrację.")
-        return
-
-    for entry in os.listdir(BASE_OUT_DIR):
-        entry_path = os.path.join(BASE_OUT_DIR, entry)
-        # Jeśli to katalog-rok (4 cyfry), pomiń
-        if not os.path.isdir(entry_path):
-            continue
-        if re.fullmatch(r"\d{4}", entry):
-            # katalog prawdopodobnie prawidłowy: "2023", "2024"
-            continue
-
-        # Przeszukujemy katalog entry_path w poszukiwaniu plików pasujących do nazwy daty
-        moved_any = False
-        for root, dirs, files in os.walk(entry_path):
-            for fname in files:
-                m = DATE_FILENAME_RE.match(fname)
-                if not m:
-                    continue
-                day, month, year = m.groups()
-                try:
-                    # validacja daty
-                    _ = date(int(year), int(month), int(day))
-                except Exception:
-                    print(f"⚠ Nieprawidłowa data w nazwie pliku {fname} — pomijam.")
-                    continue
-
-                src = os.path.join(root, fname)
-                dest_dir = os.path.join(BASE_OUT_DIR, year)
-                os.makedirs(dest_dir, exist_ok=True)
-                dest = os.path.join(dest_dir, fname)
-
-                if not os.path.exists(dest):
-                    try:
-                        shutil.move(src, dest)
-                        print(f"➡ Przeniesiono: {src} -> {dest}")
-                        moved_any = True
-                    except Exception as e:
-                        print(f"❌ Nie udało się przenieść {src} -> {dest}: {e}")
-                else:
-                    try:
-                        src_sz = os.path.getsize(src)
-                        dest_sz = os.path.getsize(dest)
-                        if src_sz == dest_sz:
-                            # duplikat -> usuń źródło
-                            os.remove(src)
-                            print(f"ℹ Duplikat (ten sam rozmiar) — usunięto źródło: {src}")
-                            moved_any = True
-                        else:
-                            ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-                            new_name = f"{fname[:-7]}-conflict-{ts}.json.gz"  # fname[:-7] to dd_mm_YYYY
-                            new_dest = os.path.join(dest_dir, new_name)
-                            shutil.move(src, new_dest)
-                            print(f"⚠ Konflikt rozmiaru — przeniesiono jako: {new_dest}")
-                            moved_any = True
-                    except Exception as e:
-                        print(f"❌ Błąd przy obsłudze konfliktu dla {src}: {e}")
-
-        # po przejściu po katalogu spróbuj usunąć pusty katalogy
-        # (tylko jeśli emptiness; nie usuwamy katalogu jeśli coś pozostało)
-        for root, dirs, files in os.walk(entry_path, topdown=False):
-            # usuń pliki tymczasowe (opcjonalnie) — tu pomijamy
-            if not os.listdir(root):
-                try:
-                    os.rmdir(root)
-                    print(f"🧹 Usunięto pusty katalog: {root}")
-                except Exception:
-                    pass
-
-        if moved_any:
-            print(f"✅ Migracja z katalogu {entry_path} zakończona.")
-        else:
-            # brak plików do migracji
-            # (możemy usunąć puste katalogi powyżej, już zrobione)
-            pass
-
-    print("🔧 Migracja zakończona.")
-
-
 def main():
     ensure_base_dir()
-    # wykonaj migrację starych plików (jeśli jakieś są w niewłaściwych folderach)
-    try:
-        migrate_misplaced_files()
-    except Exception as e:
-        print("❌ Błąd podczas migracji plików:", e)
 
+    # 1) migracja legacy (przeniesienie wszystkich istniejących plików do katalogów z rokiem)
+    try:
+        migrate_legacy_structure()
+    except Exception as e:
+        print("❌ Błąd podczas migracji legacy (kontynuuję):", e)
+
+    # 2) normalny przebieg: backfill jeśli potrzeba + pobranie ostatnich dni
     today = datetime.now(ZoneInfo(TZ)).date()
     if not os.path.exists(BACKFILL_MARKER):
         backfill()
