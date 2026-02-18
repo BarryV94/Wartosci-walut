@@ -1,8 +1,6 @@
 name: Update NBP Rates
 
 on:
-  schedule:
-    - cron: "0 14 * * *"  # 14:00 UTC (dostosuj jeśli chcesz inną godzinę)
   workflow_dispatch:
 
 permissions:
