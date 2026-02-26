@@ -1,7 +1,7 @@
 name: Update NBP Rates
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: write
