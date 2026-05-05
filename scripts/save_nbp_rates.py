@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # scripts/save_nbp_rates.py
-# Wersja z migracją legacy (przenoszenie plików z katalogów typu docs/exc/1, docs/exc/4 itd.
-# do katalogów docs/exc/<YEAR>/ na podstawie nazwy pliku lub pola "date" w JSON)
+# Wersja z migracją legacy + wymuszeniem formatu .json.gz
 #
-# Zachowuje oryginalną funkcjonalność: backfill, fetch ostatnich dni, atomic gzip write.
+# Zachowuje oryginalną funkcjonalność:
+# - backfill
+# - fetch ostatnich dni
+# - atomic gzip write
+# - migrację legacy katalogów
+# - usuwanie / konwersję starych .json tak, aby zostały tylko .json.gz
 
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -18,7 +22,7 @@ import gzip
 import hashlib
 import shutil
 import re
-from typing import Optional
+from typing import Optional, Any
 
 TZ = "Europe/Warsaw"
 
@@ -74,6 +78,28 @@ def path_for_date(d: date):
     return os.path.join(year_dir, filename)
 
 
+def plain_json_equivalent_path(gz_path: str) -> Optional[str]:
+    """
+    Dla pliku ...json.gz zwraca odpowiadający plik ...json.
+    """
+    if gz_path.endswith(".json.gz"):
+        return gz_path[:-3]  # usuwa tylko ".gz"
+    return None
+
+
+def remove_plain_json_equivalent(gz_path: str):
+    """
+    Jeśli istnieje odpowiadający plik .json dla danego .json.gz, usuwa go.
+    """
+    plain = plain_json_equivalent_path(gz_path)
+    if plain and os.path.exists(plain):
+        try:
+            os.remove(plain)
+            print("🧹 Usunięto legacy .json:", plain)
+        except Exception as e:
+            print("⚠ Nie udało się usunąć legacy .json:", plain, e)
+
+
 def write_json_gz_atomic(path, data):
     """
     Zapisuje JSON skompresowany gzip atomowo (tmp -> os.replace).
@@ -81,7 +107,7 @@ def write_json_gz_atomic(path, data):
     """
     dirn = os.path.dirname(path)
     os.makedirs(dirn, exist_ok=True)
-    # przygotuj zawartość
+
     try:
         payload_bytes = json.dumps(
             data,
@@ -120,7 +146,7 @@ def file_sha256(path):
         return None
 
 
-def read_json_from_file(path) -> Optional[dict]:
+def read_json_from_file(path) -> Optional[Any]:
     """
     Odczytuje JSON z pliku .json lub .json.gz i zwraca obiekt (lub None).
     """
@@ -135,22 +161,99 @@ def read_json_from_file(path) -> Optional[dict]:
         print("⚠ Nie udało się odczytać JSON z", path, ":", e)
         return None
 
+
+def normalized_json_signature(path: str) -> Optional[str]:
+    """
+    Zwraca logiczny podpis JSON niezależny od formatu (.json / .json.gz).
+    Przydatne przy porównywaniu plików, bo gzip daje różne bajty mimo tego samego JSON-a.
+    """
+    data = read_json_from_file(path)
+    if data is None:
+        return None
+    try:
+        normalized = json.dumps(
+            data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(normalized).hexdigest()
+    except Exception:
+        return None
+
+
+def write_json_gz_from_file_atomic(src_json_path: str, dst_gz_path: str) -> bool:
+    """
+    Czyta JSON z pliku .json i zapisuje go jako .json.gz atomowo.
+    """
+    data = read_json_from_file(src_json_path)
+    if data is None:
+        return False
+    ok = write_json_gz_atomic(dst_gz_path, data)
+    if ok:
+        try:
+            os.remove(src_json_path)
+            print("🗑 Usunięto źródłowy .json:", src_json_path)
+        except Exception as e:
+            print("⚠ Zapisano .json.gz, ale nie udało się usunąć .json:", src_json_path, e)
+    return ok
+
 # -------------------
 # Legacy migration
 # -------------------
 
 FNAME_REGEX = re.compile(r"^(\d{2})_(\d{2})_(\d{4})(?:\.json|\.json\.gz)$")
 
+
+def make_conflict_name(fname: str, ts: str) -> str:
+    """
+    Zwraca nazwę konfliktową zawsze w formacie .json.gz.
+    """
+    if fname.endswith(".json.gz"):
+        base = fname[:-8]  # usuwa ".json.gz"
+    elif fname.endswith(".json"):
+        base = fname[:-5]  # usuwa ".json"
+    else:
+        base = fname
+    return f"{base}_conflict_{ts}.json.gz"
+
+
+def migrate_single_file_to_target(src_path: str, target_path: str, fname: str):
+    """
+    Przenosi pojedynczy plik legacy do target_path.
+    Zawsze końcowy format ma być .json.gz.
+    """
+    if fname.endswith(".json.gz"):
+        # Jeśli już gzip, można przenieść atomowo
+        try:
+            os.replace(src_path, target_path)
+            print("→ Przeniesiono:", src_path, "=>", target_path)
+            return
+        except Exception as e:
+            print("❌ Błąd przenoszenia .json.gz:", src_path, e)
+            return
+
+    if fname.endswith(".json"):
+        # Jeśli zwykły JSON, kompresujemy do .json.gz
+        if write_json_gz_from_file_atomic(src_path, target_path):
+            print("→ Skonwertowano:", src_path, "=>", target_path)
+        else:
+            print("❌ Nie udało się skonwertować:", src_path)
+        return
+
+    print("ℹ Pomijam nierelewantny plik:", src_path)
+
+
 def migrate_legacy_structure():
     """
-    Przenosi pliki z katalogów legacy (np. docs/exc/1, docs/exc/4, itp.) do katalogów z rokiem.
+    Przenosi pliki z katalogów legacy (np. docs/exc/1, docs/exc/4, itp.)
+    do katalogów z rokiem.
+
     Zasady:
       - Jeśli nazwa pliku zawiera dd_mm_YYYY -> używa tego YYYY.
       - W przeciwnym razie próbuje odczytać JSON i wyciągnąć pole "date" (YYYY-MM-DD).
-      - W przypadku konfliktów porównuje sha256 i mtime:
-          * jeśli identyczne -> usuwa źródło
-          * jeśli różne i źródło nowsze -> archiwizuje stary target jako bak i zamienia
-          * jeśli różne i źródło starsze -> przenosi źródło jako file_conflict_<ts>.json(.gz)
+      - Wszystkie końcowe pliki mają być w formacie .json.gz.
+      - Konflikty rozwiązywane są przez porównanie logicznej zawartości JSON.
     """
     print("🔧 Sprawdzam strukturę legacy w", BASE_OUT_DIR)
     try:
@@ -158,28 +261,28 @@ def migrate_legacy_structure():
     except FileNotFoundError:
         print("ℹ Brak katalogu", BASE_OUT_DIR)
         return
+
     for name in entries:
         sub = os.path.join(BASE_OUT_DIR, name)
+
         # pomijamy pliki markerów i katalogi-roki (czterocyfrowe)
         if not os.path.isdir(sub):
             continue
         if re.fullmatch(r"\d{4}", name):
-            # już katalog roku -> OK
             continue
-        # jeżeli katalog wygląda jak .something lub ma pliki które warto zostawić, nadal spróbujemy przenieść wszystko co pasuje
+
         print(f"📂 Przetwarzam legacy katalog: {sub}")
         try:
             files = os.listdir(sub)
         except Exception as e:
             print("⚠ Nie mogę wymienić plików w", sub, ":", e)
             continue
+
         for fname in files:
             src_path = os.path.join(sub, fname)
             if not os.path.isfile(src_path):
-                # pomijamy podkatalogi (można rozszerzyć jeśli trzeba)
                 continue
 
-            # tylko pliki .json lub .json.gz
             if not (fname.endswith(".json") or fname.endswith(".json.gz")):
                 print("ℹ Pomijam nierelewantny plik:", src_path)
                 continue
@@ -189,18 +292,14 @@ def migrate_legacy_structure():
             if m:
                 year = m.group(3)
             else:
-                # próbuj z zawartości pliku
                 data = read_json_from_file(src_path)
                 if data:
                     dstr = None
-                    # pola możliwe: "date", "effectiveDate", "effective_date"
                     if isinstance(data, dict):
                         dstr = data.get("date") or data.get("effectiveDate") or data.get("effective_date")
-                    # jeśli JSON jest tablicą (oryginalna tabela zwraca listę wpisów) -> weź pierwszy entry
                     if not dstr and isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
                         dstr = data[0].get("date") or data[0].get("effectiveDate") or data[0].get("effective_date")
                     if dstr:
-                        # oczekujemy formatu YYYY-MM-DD lub podobnego
                         try:
                             parsed = datetime.strptime(dstr[:10], "%Y-%m-%d").date()
                             year = str(parsed.year)
@@ -208,44 +307,49 @@ def migrate_legacy_structure():
                             year = None
 
             if not year:
-                # nie udało się ustalić roku -> przenieś do bad_entries w strukturze base_out_dir
                 bad_dir = os.path.join(BASE_OUT_DIR, "bad_legacy")
                 os.makedirs(bad_dir, exist_ok=True)
                 target = os.path.join(bad_dir, fname)
-                # unikamy nadpisania
+                if fname.endswith(".json"):
+                    target += ".gz"
+
                 if os.path.exists(target):
                     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-                    target = os.path.join(bad_dir, f"{fname}.legacy_{ts}")
+                    target = os.path.join(bad_dir, make_conflict_name(fname, ts))
+
                 try:
-                    os.replace(src_path, target)
+                    if fname.endswith(".json.gz"):
+                        os.replace(src_path, target)
+                    else:
+                        if write_json_gz_from_file_atomic(src_path, target):
+                            pass
+                        else:
+                            continue
                     print("⚠ Nieznany rok dla", src_path, "=> przeniesiono do", target)
                 except Exception as e:
                     print("❌ Nie udało się przenieść", src_path, ":", e)
                 continue
 
-            # celowy katalog
             target_dir = os.path.join(BASE_OUT_DIR, year)
             os.makedirs(target_dir, exist_ok=True)
-            target_path = os.path.join(target_dir, fname)
 
-            # jeśli target nie istnieje -> przenieś atomowo
+            # Wszystkie pliki końcowe mają być .json.gz
+            if fname.endswith(".json.gz"):
+                target_name = fname
+            else:
+                target_name = fname + ".gz"
+
+            target_path = os.path.join(target_dir, target_name)
+
+            # Jeśli target nie istnieje -> proste przeniesienie / konwersja
             if not os.path.exists(target_path):
-                try:
-                    os.replace(src_path, target_path)
-                    print("→ Przeniesiono:", src_path, "=>", target_path)
-                except Exception as e:
-                    # próba kopiuj->usuwaj
-                    try:
-                        shutil.copy2(src_path, target_path)
-                        os.remove(src_path)
-                        print("→ Skopiowano(backup):", src_path, "=>", target_path)
-                    except Exception as e2:
-                        print("❌ Błąd przenoszenia", src_path, ":", e2)
+                migrate_single_file_to_target(src_path, target_path, fname)
                 continue
 
-            # target istnieje -> porównaj sha256
-            src_hash = file_sha256(src_path)
-            tgt_hash = file_sha256(target_path)
+            # target istnieje -> porównaj logiczną zawartość JSON
+            src_sig = normalized_json_signature(src_path)
+            tgt_sig = normalized_json_signature(target_path)
+
             try:
                 src_mtime = os.path.getmtime(src_path)
                 tgt_mtime = os.path.getmtime(target_path)
@@ -253,57 +357,66 @@ def migrate_legacy_structure():
                 src_mtime = None
                 tgt_mtime = None
 
-            if src_hash and tgt_hash and src_hash == tgt_hash:
-                # identyczne -> usuń źródło
+            if src_sig and tgt_sig and src_sig == tgt_sig:
+                # identyczne logicznie -> usuń źródło
                 try:
                     os.remove(src_path)
-                    print("✔ Plik identyczny, usunięto źródło:", src_path)
+                    print("✔ Plik identyczny logicznie, usunięto źródło:", src_path)
                 except Exception as e:
                     print("⚠ Nie udało się usunąć identycznego źródła:", src_path, e)
                 continue
 
-            # różne pliki -> jeśli źródło jest nowsze, zrób backup starego i przenieś
+            # różne pliki -> jeśli źródło jest nowsze, zrób backup starego targeta i podmień
             if src_mtime and tgt_mtime and src_mtime > tgt_mtime:
-                # backup starego targeta
                 bak_name = os.path.basename(target_path) + ".bak." + datetime.utcnow().strftime("%Y%m%dT%H%M%S")
                 bak_path = os.path.join(target_dir, bak_name)
                 try:
                     os.replace(target_path, bak_path)
-                    os.replace(src_path, target_path)
-                    print("⚠ Konflikt: stary target zbackupowany jako", bak_path, "— nowy plik przeniesiony jako", target_path)
+                    if fname.endswith(".json.gz"):
+                        os.replace(src_path, target_path)
+                    else:
+                        if not write_json_gz_from_file_atomic(src_path, target_path):
+                            raise RuntimeError("Nie udało się skompresować źródłowego .json")
+                    print("⚠ Konflikt: stary target zbackupowany jako", bak_path, "— nowy plik ustawiony jako", target_path)
                 except Exception as e:
-                    print("❌ Błąd przy zamianie plików (próba backup+replace):", e)
-                    # fallback: przenieś źródło z suffixem
+                    print("❌ Błąd przy zamianie plików (backup + replace):", e)
                     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-                    conflict_name = os.path.splitext(fname)[0] + f"_conflict_{ts}.json"
-                    if fname.endswith(".gz"):
-                        conflict_name += ".gz"
+                    conflict_name = make_conflict_name(fname, ts)
                     conflict_path = os.path.join(target_dir, conflict_name)
                     try:
-                        os.replace(src_path, conflict_path)
+                        if fname.endswith(".json.gz"):
+                            os.replace(src_path, conflict_path)
+                        else:
+                            if write_json_gz_from_file_atomic(src_path, conflict_path):
+                                pass
+                            else:
+                                raise RuntimeError("Nie udało się zapisać konfliktowego gzip")
                         print("⚠ Przeniesiono źródło jako konflikt:", conflict_path)
                     except Exception as e2:
                         print("❌ Nie udało się przenieść źródła konfliktowego:", e2)
                 continue
             else:
-                # target jest nowszy lub nie mamy mtime -> przenieś źródło z sufiksem konfliktowym
+                # target jest nowszy lub nie mamy mtime -> przenieś źródło z suffixem konfliktowym
                 ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-                base_no_ext = os.path.splitext(fname)[0]
-                if fname.endswith(".gz"):
-                    conflict_name = base_no_ext + f"_conflict_{ts}.json.gz"
-                else:
-                    conflict_name = base_no_ext + f"_conflict_{ts}.json"
+                conflict_name = make_conflict_name(fname, ts)
                 conflict_path = os.path.join(target_dir, conflict_name)
                 try:
-                    os.replace(src_path, conflict_path)
+                    if fname.endswith(".json.gz"):
+                        os.replace(src_path, conflict_path)
+                    else:
+                        if not write_json_gz_from_file_atomic(src_path, conflict_path):
+                            raise RuntimeError("Nie udało się skompresować źródłowego .json")
                     print("⚠ Target nowszy — przeniesiono źródło jako:", conflict_path)
                 except Exception as e:
                     print("❌ Nie udało się przenieść konfliktowego źródła:", e)
-                    # ostatecznie spróbuj kopiować
                     try:
-                        shutil.copy2(src_path, conflict_path)
-                        os.remove(src_path)
-                        print("⚠ Skopiowano źródło jako konflikt:", conflict_path)
+                        if fname.endswith(".json.gz"):
+                            shutil.copy2(src_path, conflict_path)
+                            os.remove(src_path)
+                            print("⚠ Skopiowano źródło jako konflikt:", conflict_path)
+                        else:
+                            if write_json_gz_from_file_atomic(src_path, conflict_path):
+                                print("⚠ Skopiowano źródło jako konflikt:", conflict_path)
                     except Exception as e2:
                         print("❌ Ostateczny błąd przenoszenia/kopii:", e2)
 
@@ -321,6 +434,51 @@ def migrate_legacy_structure():
     print("🔧 Migracja legacy zakończona.")
 
 
+def convert_plain_json_to_gz():
+    """
+    Przechodzi po całym BASE_OUT_DIR i konwertuje każdy zwykły .json do .json.gz.
+    Dzięki temu w katalogu zostają tylko pliki .json.gz.
+    """
+    print("🔁 Konwersja pozostałych .json -> .json.gz")
+
+    for root, _, files in os.walk(BASE_OUT_DIR):
+        for fname in files:
+            if not fname.endswith(".json") or fname.endswith(".json.gz"):
+                continue
+
+            src_path = os.path.join(root, fname)
+            gz_path = src_path + ".gz"
+
+            # Jeśli gzip już istnieje
+            if os.path.exists(gz_path):
+                src_sig = normalized_json_signature(src_path)
+                gz_sig = normalized_json_signature(gz_path)
+
+                if src_sig and gz_sig and src_sig == gz_sig:
+                    try:
+                        os.remove(src_path)
+                        print("🧹 Usunięto duplikat .json, bo istnieje już .json.gz:", src_path)
+                    except Exception as e:
+                        print("❌ Nie udało się usunąć duplikatu .json:", src_path, e)
+                else:
+                    # Konflikt: zapisujemy jeszcze raz jako konfliktowy .json.gz i usuwamy źródło
+                    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+                    conflict_path = os.path.join(root, f"{os.path.splitext(fname)[0]}_conflict_{ts}.json.gz")
+                    if os.path.exists(conflict_path):
+                        # awaryjnie nadpisz inną nazwą
+                        conflict_path = os.path.join(root, f"{os.path.splitext(fname)[0]}_conflict_{ts}_{int(time.time())}.json.gz")
+                    if write_json_gz_from_file_atomic(src_path, conflict_path):
+                        print("⚠ Konfliktowy .json zapisany jako:", conflict_path)
+                    else:
+                        print("⚠ Nie udało się przekonwertować konfliktowego .json:", src_path)
+                continue
+
+            # zwykła konwersja .json -> .json.gz
+            if write_json_gz_from_file_atomic(src_path, gz_path):
+                print("✅ Zostawiono tylko:", gz_path)
+            else:
+                print("⚠ Nie udało się przekonwertować:", src_path)
+
 # -------------------
 # HTTP + processing
 # -------------------
@@ -337,10 +495,8 @@ def http_get(url, retries=3, backoff_base=0.5, timeout=60):
                 charset = resp.headers.get_content_charset() or "utf-8"
                 return raw.decode(charset)
         except urllib.error.HTTPError as e:
-            # 404 chcemy zwrócić natychmiast (ktoś sprawdza resp.code == 404)
             if e.code == 404:
                 return e
-            # dla błędów serwera możemy spróbować retry
             if 500 <= e.code < 600 and attempt <= retries:
                 wait = backoff_base * (2 ** (attempt - 1))
                 print(f"⚠ HTTPError {e.code}, próba {attempt}/{retries}. Czekam {wait}s i retry...")
@@ -348,7 +504,6 @@ def http_get(url, retries=3, backoff_base=0.5, timeout=60):
                 continue
             return e
         except Exception as e:
-            # transient network error - retry limited times
             if attempt <= retries:
                 wait = backoff_base * (2 ** (attempt - 1))
                 print(f"⚠ Błąd sieci ({e}), próba {attempt}/{retries}. Czekam {wait}s i retry...")
@@ -358,7 +513,6 @@ def http_get(url, retries=3, backoff_base=0.5, timeout=60):
             return e
 
 
-# defensywna funkcja przetwarzajaca pojedyńczy wpis
 def process_table_entry(entry):
     # defensywne pobranie pól
     eff_date = None
@@ -380,6 +534,9 @@ def process_table_entry(entry):
         return False
 
     out_path = path_for_date(d)
+
+    # jeśli istnieje legacy .json dla tej samej daty, usuń go
+    remove_plain_json_equivalent(out_path)
 
     if os.path.exists(out_path):
         append_last_marker(out_path)
@@ -437,10 +594,12 @@ def fetch_range(start_d: date, end_d: date):
         return None
 
 
-def backfill():
+def backfill(today: Optional[date] = None):
+    if today is None:
+        today = datetime.now(ZoneInfo(TZ)).date()
+
     print("🔁 BACKFILL od", START_DATE.isoformat())
     cur = START_DATE
-    today = date.today()
     bad_dir = os.path.join(BASE_OUT_DIR, "bad_entries")
     os.makedirs(bad_dir, exist_ok=True)
 
@@ -453,7 +612,6 @@ def backfill():
                 try:
                     process_table_entry(entry)
                 except Exception as e:
-                    # nie przerywamy backfilla — zapisujemy problematyczny wpis do folderu bad_entries
                     print("❌ Błąd przetwarzania wpisu (zapisuję do bad_entries):", e)
                     bad_path = os.path.join(
                         bad_dir,
@@ -475,6 +633,7 @@ def backfill():
             f.write(datetime.utcnow().isoformat())
     except Exception as e:
         print("❌ Nie udało się zapisać BACKFILL_MARKER:", e)
+
     print("✅ BACKFILL ZAKOŃCZONY")
 
 
@@ -494,7 +653,6 @@ def fetch_recent_and_today(today: date, lookback_days: int = 7):
         url = SINGLE_DAY_URL.format(date=d.isoformat())
         resp = http_get(url)
         if isinstance(resp, urllib.error.HTTPError):
-            # 404 -> brak tabeli w tym dniu (weekend/święto)
             if resp.code == 404:
                 print(f"ℹ {d.isoformat()}: brak (404)")
                 continue
@@ -521,19 +679,33 @@ def fetch_recent_and_today(today: date, lookback_days: int = 7):
 def main():
     ensure_base_dir()
 
-    # 1) migracja legacy (przeniesienie wszystkich istniejących plików do katalogów z rokiem)
+    # 1) migracja legacy
     try:
         migrate_legacy_structure()
     except Exception as e:
         print("❌ Błąd podczas migracji legacy (kontynuuję):", e)
 
-    # 2) normalny przebieg: backfill jeśli potrzeba + pobranie ostatnich dni
+    # 2) konwersja wszystkich pozostałych .json -> .json.gz
+    try:
+        convert_plain_json_to_gz()
+    except Exception as e:
+        print("❌ Błąd podczas konwersji .json -> .json.gz (kontynuuję):", e)
+
+    # 3) normalny przebieg: backfill jeśli potrzeba + pobranie ostatnich dni
     today = datetime.now(ZoneInfo(TZ)).date()
     if not os.path.exists(BACKFILL_MARKER):
-        backfill()
+        backfill(today=today)
     else:
         print("✔ Backfill już wykonany")
+
     fetch_recent_and_today(today, lookback_days=7)
+
+    # 4) końcowe sprzątanie: jeszcze raz usuń / skonwertuj ewentualne pliki .json
+    try:
+        convert_plain_json_to_gz()
+    except Exception as e:
+        print("❌ Błąd końcowego sprzątania .json -> .json.gz:", e)
+
     sys.exit(0)
 
 
